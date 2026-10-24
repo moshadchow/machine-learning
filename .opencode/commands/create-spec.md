@@ -1,6 +1,6 @@
 ---
 description: Create a spec file and feature branch for the next machine-learning step
-argument-hint: "Step number and feature name e.g. 02 Loan Approval Evaluation"
+argument-hint: "Step number and feature name e.g. 02 Order Prediction Evaluation"
 allowed-tools: Read, Write, Glob, Bash(git:*)
 ---
 
@@ -30,11 +30,8 @@ to clarify before proceeding.
 Read these before writing the spec:
 - All `.ipynb` notebooks in the project root — current models,
   features, targets, and metrics in use
-  - `logistic_regression_eg.ipynb` — logistic regression on
-    `dataset/loan_prediction_dataset_v2.csv`
   - `order_prediction_dataset_v2.ipynb` — multi-output linear
     regression on the broker summary report
-- `loan_prediction_dataset.py` — existing script (may be empty)
 - The header row (first line) of every CSV in `dataset/` —
   confirm exact column names and formats before writing the spec
 - All files in `specs/` — avoid duplicating existing plans
@@ -69,7 +66,7 @@ Always verify column names against the actual CSV header.
 The model type and preprocessing strategy, e.g.:
 - train/test split ratio
 - scaling/encoding steps
-- estimator to use (LogisticRegression, LinearRegression, etc.)
+- estimator to use (LinearRegression, etc.)
 
 ## Evaluation
 Which metrics will be reported and what counts as success.
