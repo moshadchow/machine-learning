@@ -2,9 +2,10 @@
 
 Authenticates against the OMS API (login/MFA/refresh via oms_auth.py),
 fetches per-broker aggregates (oms_api.py), trains a multi-output
-LinearRegression on the in-memory dataset once at startup (cached), and
-renders an interactive UI: enter a broker's turnover in BDT to predict
-total orders and total trades, with evaluation metrics in an expander.
+LinearRegression on eligible in-memory data (totalValue > 0) once at
+startup (cached), and renders an interactive UI: enter a broker's
+turnover in BDT to predict total orders and total trades, with evaluation
+metrics in an expander.
 
 Requires OMS_* environment variables or a local .env file (see
 oms_auth.py and .env.example). Run with:
@@ -22,6 +23,7 @@ import model
 import oms_api
 from oms_auth import OmsAuthError, OmsAuthenticator, load_auth_config
 
+
 # --- Page configuration ---
 st.set_page_config(
     page_title="Broker Order Predictor",
@@ -35,7 +37,8 @@ st.set_page_config(
 def load_app_bundle():
     """Authenticate, fetch API data, evaluate, and train the serving model.
 
-    Returns (df, fetch_report, metrics_or_none, serving_model).
+    Applies training data eligibility (totalValue > 0). Returns
+    (eligible_df, fetch_report, metrics_or_none, serving_model, eligibility_stats).
     Raises OmsConfigError/OmsAuthError/InsufficientDataError on failure.
     """
     data_config = oms_api.load_config()
@@ -52,6 +55,13 @@ def load_app_bundle():
             "per-broker failure reasons."
         )
 
+    eligible_df, eligibility = model.filter_eligible_dataset(df)
+    if eligibility["eligible"] == 0:
+        raise model.InsufficientDataError(
+            "No records satisfy totalValue > 0. All observations have "
+            "totalValue <= 0 or invalid values; none were fabricated."
+        )
+
     # Evaluation metrics are withheld when the dataset is too small.
     metrics = None
     try:
@@ -60,8 +70,7 @@ def load_app_bundle():
         pass
 
     serving_model = model.train_full_model(df)
-    return df, report, metrics, serving_model
-
+    return eligible_df, report, metrics, serving_model, eligibility
 
 # --- App header ---
 st.title("Broker Order Predictor")
@@ -73,7 +82,7 @@ st.caption(
 
 # --- Load or surface errors ---
 try:
-    df, fetch_report, metrics, serving_model = load_app_bundle()
+    eligible_df, fetch_report, metrics, serving_model, eligibility = load_app_bundle()
 except oms_api.OmsConfigError as exc:
     st.error(
         "Configuration error — fix the environment variables (or .env file) "
@@ -103,6 +112,13 @@ with st.expander(
         f"{fetch_report.date_count} days = {fetch_report.expected_pairs} "
         "expected broker-date pairs (one observation per valid pair)."
     )
+    st.info(
+        f"**Training data eligibility:** {eligibility['eligible']} / "
+        f"{eligibility['total']} observations eligible (totalValue > 0). "
+        f"Excluded {eligibility['excluded']} "
+        f"({eligibility['excluded_le_zero']} with totalValue <= 0, "
+        f"{eligibility['excluded_invalid']} invalid/missing)."
+    )
     if fetch_report.failed:
         by_broker = fetch_report.failed_by_broker()
         st.warning(
@@ -121,8 +137,8 @@ with st.expander(
         st.write("All broker-date pairs fetched successfully.")
 
 # --- Prediction input ---
-min_turnover = float(df[model.FEATURE].min())
-max_turnover = float(df[model.FEATURE].max())
+min_turnover = float(eligible_df[model.FEATURE].min())
+max_turnover = float(eligible_df[model.FEATURE].max())
 
 # Clamp the default into the valid range so Streamlit doesn't reject it
 # when the API data range differs from the old hardcoded default.
@@ -150,10 +166,11 @@ if st.button("Predict orders", type="primary"):
 with st.expander("Model evaluation & data preview"):
     if metrics is None:
         st.info(
-            f"**Evaluation metrics withheld.** Only {len(df)} valid observation(s) "
-            f"were fetched, but at least {model.MIN_OBS_FOR_METRICS} are needed for "
-            "a meaningful temporal train/test evaluation. Predictions above are "
-            "still served from a model trained on all fetched rows."
+            f"**Evaluation metrics withheld.** Only {len(eligible_df)} eligible "
+            f"observation(s) (of {eligibility['total']} fetched) were used, but at "
+            f"least {model.MIN_OBS_FOR_METRICS} are needed for a meaningful "
+            "temporal train/test evaluation. Predictions above are still served "
+            "from a model trained on all eligible rows."
         )
     else:
         st.markdown(
@@ -163,6 +180,8 @@ with st.expander("Model evaluation & data preview"):
             "random split would leak future days into training). "
             f"Train: {metrics['train_rows']} rows ({metrics['train_dates']}); "
             f"Test: {metrics['test_rows']} rows ({metrics['test_dates']}). "
+            f"Eligible: {eligibility['eligible']} / {eligibility['total']} "
+            f"(excluded {eligibility['excluded']} with totalValue <= 0/invalid). "
             "Shown for transparency, not as a quality gate."
         )
         for target in model.TARGETS:
@@ -178,11 +197,15 @@ with st.expander("Model evaluation & data preview"):
         st.markdown("**Predictions vs actual (most recent test dates)**")
         st.dataframe(metrics["predictions_vs_actual"], hide_index=True)
 
-    st.markdown(f"**Source data preview** (in-memory, {len(df)} rows fetched from API)")
-    st.dataframe(df, hide_index=True)
+    st.markdown(
+        f"**Source data preview** (in-memory, {len(eligible_df)} eligible rows "
+        f"from API; {eligibility['excluded']} excluded with totalValue <= 0)"
+    )
+    st.dataframe(eligible_df, hide_index=True)
 
     st.caption(
-        "The predictor above is trained on all fetched rows; the metrics (when "
+        "The predictor above is trained on all eligible rows; the metrics (when "
         "shown) use the temporal split-trained model — earlier dates for "
-        "training, the most recent dates for evaluation."
+        "training, the most recent dates for evaluation. Observations with "
+        "totalValue <= 0 are excluded (no zero-filling)."
     )
