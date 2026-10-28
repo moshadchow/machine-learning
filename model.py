@@ -1,62 +1,112 @@
 """Model module for broker order prediction.
 
-Reproduces the modeling logic from order_prediction_dataset_v2.ipynb:
-multi-output LinearRegression predicting Submitted Order and Executed Order
-from Turnover (BDT). No Streamlit code lives here — the app imports from
-this module, and it can also be run standalone for verification:
+Multi-output LinearRegression predicting total orders and total trades
+from turnover (totalValue), trained on day-wise data fetched live from
+the OMS API (see oms_api.py; authentication via oms_auth.py). Each row is
+one broker-day observation (Date, BrokerId, totalValue, total, totalTrade).
+
+Evaluation uses a TEMPORAL split — train on earlier dates, test on the
+most recent ~20% of dates — because daily observations from the same
+broker are correlated and a random split would leak future days into
+training (documented methodology change vs the notebook's random split;
+see spec 02 §3.4). The estimator itself is unchanged: multi-output
+LinearRegression.
+
+No Streamlit code lives here — the app imports from this module, and it
+can also be run standalone for verification (requires OMS_* env vars or
+a local .env file):
 
     mlvenv\\Scripts\\python model.py
 """
 
-from pathlib import Path
-
 import pandas as pd
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, r2_score
-from sklearn.model_selection import train_test_split
 
-# --- Constants (match the notebook exactly) ---
-FEATURE = "Turnover (BDT)"
-TARGETS = ["Submitted Order", "Executed Order"]
-DATA_PATH = (
-    Path(__file__).resolve().parent
-    / "dataset"
-    / "Broker_Summary_Report_2026-01-01_to_2026-02-26.csv"
-)
-TEST_SIZE = 0.2
-RANDOM_STATE = 42
+# --- Constants ---
+# Column names come from the OMS API field mapping (see oms_api.py).
+DATE_COL = "Date"  # metadata only — never a model feature
+BROKER_COL = "BrokerId"  # metadata only — never a model feature
+FEATURE = "totalValue"  # turnover in BDT
+TARGETS = ["total", "totalTrade"]
+TEST_SIZE = 0.2  # most recent share of DATES held out for evaluation
+RANDOM_STATE = 42  # for any stochastic estimator (the split itself is deterministic)
+
+# Minimum data requirements for the modeling/evaluation approach:
+# - Below MIN_OBS_TO_TRAIN, LinearRegression cannot be fit meaningfully.
+# - The 80/20 TEMPORAL split needs at least 2 test rows for R² to be
+#   defined and at least 2 distinct dates to split on. Below that,
+#   metrics would be undefined or misleading, so they are withheld
+#   (predictions still work).
+MIN_OBS_TO_TRAIN = 2
+MIN_OBS_FOR_METRICS = 10
+MIN_DATES_FOR_METRICS = 2
 
 
-def load_and_clean_data(path: Path = DATA_PATH) -> pd.DataFrame:
-    """Load the broker summary CSV and clean comma-formatted numeric columns."""
-    df = pd.read_csv(path)
-    for col in TARGETS:
-        df[col] = df[col].astype(str).str.replace(",", "").astype(float)
-    return df
+class InsufficientDataError(RuntimeError):
+    """Raised when the dataset is too small for the requested operation."""
+
+
+def temporal_split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split by date: earlier dates -> train, most recent dates -> test.
+
+    The test set is the most recent ceil(TEST_SIZE * n_dates) distinct
+    dates (at least one). Splitting by DATE (not by row) keeps every
+    broker's observations from a given day on the same side, so no same-day
+    information leaks between train and test. Requires at least two
+    distinct dates.
+    """
+    dates = sorted(df[DATE_COL].dropna().unique())
+    if len(dates) < MIN_DATES_FOR_METRICS:
+        raise InsufficientDataError(
+            f"Temporal evaluation needs at least {MIN_DATES_FOR_METRICS} "
+            f"distinct dates, but the data covers only {len(dates)} "
+            f"({dates[0] if dates else 'none'}). Widen OMS_FROM_DATE..OMS_TO_DATE."
+        )
+    n_test_dates = max(1, int(len(dates) * TEST_SIZE + 0.999))  # ceil
+    cutoff_date = dates[-n_test_dates]
+    train_df = df[df[DATE_COL] < cutoff_date]
+    test_df = df[df[DATE_COL] >= cutoff_date]
+    return train_df, test_df
 
 
 def evaluate_model(df: pd.DataFrame) -> dict:
-    """Train on the 80% split and evaluate on the 20% test split.
+    """Train on the earlier dates and evaluate on the most recent dates.
+
+    Temporal split (see temporal_split) — no random_state needed because
+    the split is deterministic. Raises InsufficientDataError when the
+    dataset has fewer than MIN_OBS_FOR_METRICS rows or fewer than two
+    distinct dates.
 
     Returns per-target and average R²/MAE, a predictions-vs-actual table,
-    and the split-trained model itself (used for notebook-fidelity checks).
+    and the split-trained model itself.
     """
-    X = df[[FEATURE]]
-    y = df[TARGETS]
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE
-    )
+    if len(df) < MIN_OBS_FOR_METRICS:
+        raise InsufficientDataError(
+            f"Cannot compute evaluation metrics with {len(df)} observations: "
+            f"the {int(TEST_SIZE * 100)}% temporal test split needs at least "
+            f"2 rows, which requires at least {MIN_OBS_FOR_METRICS} total "
+            f"observations (fetched {len(df)}). Check the fetch report for "
+            "failed broker-date pairs."
+        )
+
+    train_df, test_df = temporal_split(df)
+
+    X_train, y_train = train_df[[FEATURE]], train_df[TARGETS]
+    X_test, y_test = test_df[[FEATURE]], test_df[TARGETS]
     model = LinearRegression()
     model.fit(X_train, y_train)
     y_pred = model.predict(X_test)
 
     predictions_vs_actual = pd.DataFrame(
         {
+            DATE_COL: test_df[DATE_COL].values,
+            BROKER_COL: test_df[BROKER_COL].values,
             FEATURE: X_test[FEATURE].values,
-            "Actual Submitted": y_test[TARGETS[0]].values,
-            "Pred Submitted": y_pred[:, 0].round(2),
-            "Actual Executed": y_test[TARGETS[1]].values,
-            "Pred Executed": y_pred[:, 1].round(2),
+            f"Actual {TARGETS[0]}": y_test[TARGETS[0]].values,
+            f"Pred {TARGETS[0]}": y_pred[:, 0].round(2),
+            f"Actual {TARGETS[1]}": y_test[TARGETS[1]].values,
+            f"Pred {TARGETS[1]}": y_pred[:, 1].round(2),
         }
     )
 
@@ -71,18 +121,32 @@ def evaluate_model(df: pd.DataFrame) -> dict:
         "mae_avg": float(mean_absolute_error(y_test, y_pred)),
         "predictions_vs_actual": predictions_vs_actual,
         "split_model": model,
+        "train_rows": len(train_df),
+        "test_rows": len(test_df),
+        "train_dates": f"{train_df[DATE_COL].min()} .. {train_df[DATE_COL].max()}",
+        "test_dates": f"{test_df[DATE_COL].min()} .. {test_df[DATE_COL].max()}",
     }
 
 
 def train_full_model(df: pd.DataFrame) -> LinearRegression:
-    """Fit the serving model on all rows (dataset is too small to withhold data)."""
+    """Fit the serving model on all rows (dataset is too small to withhold data).
+
+    Raises InsufficientDataError if the dataset has fewer than
+    MIN_OBS_TO_TRAIN rows.
+    """
+    if len(df) < MIN_OBS_TO_TRAIN:
+        raise InsufficientDataError(
+            f"Cannot train the model with {len(df)} observations: at least "
+            f"{MIN_OBS_TO_TRAIN} are required. Check the fetch report above "
+            "for failed broker IDs."
+        )
     model = LinearRegression()
     model.fit(df[[FEATURE]], df[TARGETS])
     return model
 
 
 def predict_orders(model: LinearRegression, turnover: float) -> dict[str, int]:
-    """Predict submitted/executed orders for a single turnover value."""
+    """Predict total orders and total trades for a single turnover value."""
     X_new = pd.DataFrame({FEATURE: [turnover]})
     predictions = model.predict(X_new)
     return {
@@ -91,49 +155,83 @@ def predict_orders(model: LinearRegression, turnover: float) -> dict[str, int]:
     }
 
 
-# --- CLI verification: reproduce the notebook's stored outputs ---
+# --- CLI verification: authenticate, fetch from the API, train, and report ---
 if __name__ == "__main__":
-    df = load_and_clean_data()
-    metrics = evaluate_model(df)
+    import oms_api
+    from oms_auth import OmsAuthError, OmsAuthenticator, load_auth_config
 
-    print("--- Test Set Predictions vs Actual ---")
-    print(metrics["predictions_vs_actual"])
+    try:
+        config = oms_api.load_config()
+        auth_config = load_auth_config()
+    except (oms_api.OmsConfigError, OmsAuthError) as exc:
+        raise SystemExit(str(exc))
 
-    print("\n--- Model Evaluation Metrics (per target) ---")
-    for target in TARGETS:
+    authenticator = OmsAuthenticator(auth_config)
+    try:
+        authenticator.get_access_token()
+    except OmsAuthError as exc:
+        raise SystemExit(f"Authentication failed: {exc}")
+
+    df, report = oms_api.build_dataset(config, authenticator)
+
+    print("--- Fetch Report ---")
+    print(report.summary())
+    oms_api.print_failure_summary(report)
+
+    print(f"\n--- Dataset ({len(df)} rows, {report.date_count} days "
+          f"x up to {report.broker_count} brokers) ---")
+    if len(df) > 20:
+        print(df.head(10).to_string(index=False))
+        print(f"... ({len(df) - 20} more rows) ...")
+        print(df.tail(10).to_string(index=False))
+    else:
+        print(df.to_string(index=False))
+
+    # Evaluation metrics (withheld when the dataset is too small).
+    print("\n--- Model Evaluation (temporal split) ---")
+    try:
+        metrics = evaluate_model(df)
         print(
-            f"{target}: R2={metrics['r2_per_target'][target]:.4f}  "
-            f"MAE={metrics['mae_per_target'][target]:.2f}"
+            f"Train: {metrics['train_rows']} rows ({metrics['train_dates']}) | "
+            f"Test: {metrics['test_rows']} rows ({metrics['test_dates']})"
         )
-    print(f"Average: R2={metrics['r2_avg']:.4f}  MAE={metrics['mae_avg']:.2f}")
+        print("Test set predictions vs actual (most recent dates):")
+        print(metrics["predictions_vs_actual"].to_string(index=False))
+        print()
+        for target in TARGETS:
+            print(
+                f"{target}: R2={metrics['r2_per_target'][target]:.4f}  "
+                f"MAE={metrics['mae_per_target'][target]:.2f}"
+            )
+        print(f"Average: R2={metrics['r2_avg']:.4f}  MAE={metrics['mae_avg']:.4f}")
+    except InsufficientDataError as exc:
+        print(f"Metrics withheld: {exc}")
 
-    # Notebook fidelity check: the notebook printed uniform-average R2/MAE
-    # and sample predictions from the split-trained model.
-    print("\n--- Notebook Fidelity Check (split-trained model) ---")
-    sample_turnover = pd.DataFrame(
-        {FEATURE: [6_000_000_000, 15_000_000_000, 30_000_000_000]}
-    )
-    split_preds = metrics["split_model"].predict(sample_turnover)
-    print(
-        pd.DataFrame(
-            {
-                FEATURE: sample_turnover[FEATURE],
-                "Predicted Submitted Order": split_preds[:, 0].round().astype(int),
-                "Predicted Executed Order": split_preds[:, 1].round().astype(int),
-            }
-        )
-    )
-
-    # The app serves a model trained on all rows; record its predictions too.
+    # Serving model (trained on all rows) sample predictions.
     print("\n--- Serving Model Sample Predictions (trained on all rows) ---")
-    serving_model = train_full_model(df)
+    try:
+        serving_model = train_full_model(df)
+    except InsufficientDataError as exc:
+        raise SystemExit(str(exc))
+
+    # Sample turnovers drawn from the fetched data range (not hardcoded).
+    sample_values = df[FEATURE]
+    sample_turnover = pd.DataFrame(
+        {
+            FEATURE: [
+                float(sample_values.min()),
+                float(sample_values.median()),
+                float(sample_values.max()),
+            ]
+        }
+    )
     serving_preds = serving_model.predict(sample_turnover)
     print(
         pd.DataFrame(
             {
                 FEATURE: sample_turnover[FEATURE],
-                "Predicted Submitted Order": serving_preds[:, 0].round().astype(int),
-                "Predicted Executed Order": serving_preds[:, 1].round().astype(int),
+                f"Predicted {TARGETS[0]}": serving_preds[:, 0].round().astype(int),
+                f"Predicted {TARGETS[1]}": serving_preds[:, 1].round().astype(int),
             }
-        )
+        ).to_string(index=False)
     )
